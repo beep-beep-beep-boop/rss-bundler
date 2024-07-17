@@ -43,6 +43,8 @@ type Config struct {
 	Out_author_name string `env:"OUTFEED_AUTHOR, default=bundler robot"`
 	// the author email for the output feed.
 	Out_author_email string `env:"OUTFEED_AUTHOR_EMAIL, default="`
+
+	Out_error_cooldown time.Duration `env:"OUTFEED_ERROR_COOLDOWN, default=24h`
 }
 
 func main() {
@@ -139,6 +141,37 @@ type rssBundlerService struct {
 	RssBundler
 	cached_feed  string
 	update_cache chan string
+
+	// the service will use this to communicate with the bundleCreatorService
+	bundle_creator bundleCreator
+}
+
+// this actually fetches the rss feeds and creates the bundled one. it's in a
+// seperate service so the application can handle panics better (although
+// hopefully that won't happen).
+type bundleCreator struct {
+	RssBundler
+	// it will send the result on the channel you send it once it's done.
+	Make_bundle chan chan string
+}
+
+// if certain errors happen when creating the bundle (like an input feed was
+// down), we put an entry saying there was an error in our output bundled feed.
+// Entries need to have a time and a uuid; this is how the user's rss client
+// knows when it is a new entry versus one it has already got in a previous
+// fetch of the feed. the errorEntryMetadataService generates and caches the
+// time and uuid for error entries, so they aren't shown a new one every hour
+// (or however often we recreate the bundled feed). it can invalidate the cache
+// every n hours so that if errors continue happening, users will still see them
+// without spamming them with them.
+type errorEntryMetadataService struct {
+	RssBundler
+	metadata_cache map[string]errorEntryMetadata
+}
+
+type errorEntryMetadata struct {
+	Entry_uuid string
+	Entry_time time.Time
 }
 
 func NewBundler(
@@ -153,13 +186,20 @@ func NewBundler(
 		get_feed: make(chan string),
 	}
 
-	e_server := rssBundlerService{
-		RssBundler:   e,
-		cached_feed:  "",
-		update_cache: make(chan string),
+	e_bundle_service := bundleCreator{
+		RssBundler:  e,
+		Make_bundle: make(chan chan string),
 	}
 
-	soup.Add(e_server)
+	e_service := rssBundlerService{
+		RssBundler:     e,
+		cached_feed:    "",
+		update_cache:   make(chan string),
+		bundle_creator: e_bundle_service,
+	}
+
+	soup.Add(e_bundle_service)
+	soup.Add(e_service)
 
 	return &e
 }
@@ -178,13 +218,13 @@ func (e *RssBundler) GetFeed() (string, bool) {
 
 func (e rssBundlerService) Serve(ctx context.Context) error {
 	// update the cache right away once the service starts.
-	e.doUpdateCache(ctx)
+	e.doUpdateCache()
 	refetch := time.NewTicker(e.config.Fetch_interval)
 
 	for {
 		select {
 		case <-refetch.C:
-			e.doUpdateCache(ctx)
+			e.doUpdateCache()
 		case e.get_feed <- e.cached_feed:
 		case f := <-e.update_cache:
 			e.log.Debug("updated cached feed")
@@ -195,13 +235,24 @@ func (e rssBundlerService) Serve(ctx context.Context) error {
 	}
 }
 
-func (e *rssBundlerService) doUpdateCache(ctx context.Context) {
-	go updateCache(
-		ctx,
-		e.log.WithGroup("updater"),
-		e.config,
-		e.update_cache,
-	)
+func (e bundleCreator) Serve(ctx context.Context) error {
+	for {
+		select {
+		case response := <-e.Make_bundle:
+			updateCache(
+				ctx,
+				e.log,
+				e.config,
+				response,
+			)
+		case <-ctx.Done():
+			return nil
+		}
+	}
+}
+
+func (e *rssBundlerService) doUpdateCache() {
+	e.bundle_creator.Make_bundle <- e.update_cache
 }
 
 func updateCache(
