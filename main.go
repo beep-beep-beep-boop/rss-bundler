@@ -37,8 +37,6 @@ func main() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
-	soup.ServeBackground(ctx)
-
 	config, err := common.MakeConfig(ctx)
 	if err != nil {
 		log.Error("configuration error", "err", err)
@@ -76,6 +74,8 @@ func main() {
 		}
 	}()
 	log.Info("http server is listening for requests :3", "address", config.Listen_addr)
+
+	soup.ServeBackground(ctx)
 
 	// stop the server once ctx is done
 	context.AfterFunc(ctx, func() {
