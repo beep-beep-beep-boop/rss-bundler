@@ -55,8 +55,10 @@ OUTFEED_AUTHOR_EMAIL="example@example.com"
 # indicating that that feed had an error. this is how often to re-post that
 # entry, if the feed continues to fail. (restarting the program will also
 # re-post the entry, since it does not save any state.)
+# optional.
 OUTFEED_ERROR_COOLDOWN=24h
 
 # whether to do debug logging.
+# optional.
 DEBUG=false
 ```
