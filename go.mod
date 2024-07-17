@@ -3,6 +3,7 @@ module github.com/beep-beep-beep-boop/rss-bundler
 go 1.22.5
 
 require (
+	github.com/google/uuid v1.6.0
 	github.com/gorilla/feeds v1.2.0
 	github.com/mmcdole/gofeed v1.3.0
 	github.com/sethvargo/go-envconfig v1.1.0
