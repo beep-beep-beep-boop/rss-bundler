@@ -4,17 +4,46 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/base32"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
+	"os"
+	"os/signal"
+	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/mmcdole/gofeed"
 
 	"github.com/gorilla/feeds"
+	"github.com/sethvargo/go-envconfig"
 	"github.com/thejerf/suture/v4"
 	"github.com/thejerf/sutureslog"
 )
+
+type Config struct {
+	// the list of feeds to bundle into one feed.
+	Feed_urls []string `env:"FEED_URLS, required"`
+	// how often to fetch all of the feeds and update our bundled one.
+	Fetch_interval time.Duration `env:"FETCH_INTERVAL, default=1h"`
+	// timout when fetchinig a single feed.
+	Fetch_timeout time.Duration `env:"FETCH_TIMEOUT, default=1m"`
+	// address the server should listen on.
+	Listen_addr string `env:"LISTEN_ADDR, default=:3000"`
+
+	// the title for the output feed.
+	Out_title string `env:"OUTFEED_TITLE, default=bundle"`
+	// the link for the output feed.
+	Out_link string `env:"OUTFEED_LINK, default="`
+	// the description for the output feed.
+	Out_description string `env:"OUTFEED_DESCRIPTION, default=this is a bundle feed, which contains the entries from multiple rss feeds."`
+	// the author name for the output feed.
+	Out_author_name string `env:"OUTFEED_AUTHOR, default=bundler robot"`
+	// the author email for the output feed.
+	Out_author_email string `env:"OUTFEED_AUTHOR_EMAIL, default="`
+}
 
 func main() {
 	log := slog.Default()
@@ -27,62 +56,135 @@ func main() {
 		BackoffLevel:          slog.LevelInfo,
 		ResumeLevel:           slog.LevelDebug,
 	}
+
+	var config Config
+
 	soup := suture.New("soupervisor", suture.Spec{
 		EventHook: soup_logger.MustHook(),
 	})
 
+	ctx, cancel := context.WithCancel(context.Background())
+
+	soup.ServeBackground(ctx)
+
+	err := envconfig.Process(ctx, &config)
+	if err != nil {
+		log.Error("configuration error", "err", err)
+		os.Exit(1)
+	}
+
+	bundler := NewBundler(
+		log,
+		soup,
+		config,
+	)
+
+	http.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "Content-type: text/xml;charset=UTF-8")
+		rss_str, ok := bundler.GetFeed()
+		if ok {
+			w.WriteHeader(http.StatusOK)
+			_, err := fmt.Fprint(w, rss_str)
+			if err != nil {
+				log.Error("write error writing to http.ResponseWriter", "err", err)
+			}
+		} else {
+			w.WriteHeader(http.StatusInternalServerError)
+		}
+	})
+
+	server := &http.Server{Addr: config.Listen_addr}
+
+	// start the server
+	go func() {
+		err := server.ListenAndServe()
+		if err != nil {
+			log.Error("http server failed to listen", "err", err)
+			os.Exit(1)
+		}
+	}()
+	log.Info("http server is listening for requests :3", "address", config.Listen_addr)
+
+	// stop the server once ctx is done
+	context.AfterFunc(ctx, func() {
+		// allow it to take 5 seconds before forcibly shutting down.
+		deadline, _ := context.WithDeadlineCause(
+			context.Background(),
+			time.Now().Add(time.Second*5),
+			errors.New("http server took too long to close"),
+		)
+		err := server.Shutdown(deadline)
+		if err != nil {
+			log.Error("error shutting down http server", "err", err)
+		}
+	})
+
+	should_exit := make(chan os.Signal, 1)
+	signal.Notify(should_exit, os.Interrupt, syscall.SIGTERM)
+
+	<-should_exit
+	log.Info("recieved exit signal, closing...")
+	cancel()
 }
 
-type rssBundler struct {
-	log *slog.Logger
-	// the list of the rss feed urls to bundle into one feed.
-	feed_urls []string
-	// the interval it should re-fetch the feeds at.
-	fetch_interval time.Duration
-	// how long it takes to timeout when fetching a single feed.
-	fetch_timeout time.Duration
+type RssBundler struct {
+	log    *slog.Logger
+	config Config
 
 	// get the current bundled rss feed as a string.
 	get_feed chan string
 }
 
 type rssBundlerService struct {
-	rssBundler
+	RssBundler
 	cached_feed  string
 	update_cache chan string
 }
 
-func newBundler(
+func NewBundler(
 	l *slog.Logger,
-	feed_urls []string,
-	fetch_interval time.Duration,
-	fetch_timeout time.Duration,
-) (*rssBundler, error) {
+	soup *suture.Supervisor,
+	config Config,
+) *RssBundler {
 
-	e := rssBundler{
-		log:            l.WithGroup("bundler"),
-		feed_urls:      feed_urls,
-		fetch_interval: fetch_interval,
-		fetch_timeout:  fetch_timeout,
-		get_feed:       make(chan string),
+	e := RssBundler{
+		log:      l.WithGroup("bundler"),
+		config:   config,
+		get_feed: make(chan string),
 	}
 
-	return &e, nil
+	e_server := rssBundlerService{
+		RssBundler:   e,
+		cached_feed:  "",
+		update_cache: make(chan string),
+	}
+
+	soup.Add(e_server)
+
+	return &e
+}
+
+// gets the current cached rss feed as a string. returns true if the feed was
+// gotten successfully, false if not.
+func (e *RssBundler) GetFeed() (string, bool) {
+	select {
+	case feed := <-e.get_feed:
+		return feed, true
+	case <-time.After(time.Millisecond * 500):
+		e.log.Error("GetFeed: failed to get feed")
+		return "", false
+	}
 }
 
 func (e rssBundlerService) Serve(ctx context.Context) error {
-	refetch := time.NewTicker(e.fetch_interval)
+	// update the cache right away once the service starts.
+	e.doUpdateCache(ctx)
+	refetch := time.NewTicker(e.config.Fetch_interval)
 
 	for {
 		select {
 		case <-refetch.C:
-			go updateCache(
-				ctx,
-				e.log.WithGroup("updater"),
-				e.feed_urls,
-				e.fetch_timeout,
-				e.update_cache,
-			)
+			e.doUpdateCache(ctx)
 		case e.get_feed <- e.cached_feed:
 		case f := <-e.update_cache:
 			e.log.Debug("updated cached feed")
@@ -93,35 +195,94 @@ func (e rssBundlerService) Serve(ctx context.Context) error {
 	}
 }
 
+func (e *rssBundlerService) doUpdateCache(ctx context.Context) {
+	go updateCache(
+		ctx,
+		e.log.WithGroup("updater"),
+		e.config,
+		e.update_cache,
+	)
+}
+
 func updateCache(
 	ctx context.Context,
 	log *slog.Logger,
-	urls []string,
-	timeout time.Duration,
+	c Config,
 	send_result_to chan string,
 ) {
-	var in_feeds []gofeed.Feed
-	var errors []feeds.Item
+	var out_items []feeds.Item
 
-	// first we fetch all the feeds from their urls.
-	for _, url := range urls {
+	// we fetch the feeds and append their items to `out_items`
+	for _, url := range c.Feed_urls {
+		// fetch the feed.
 		feed, err := fetchFeed(
-			ctx, log, url, timeout,
+			ctx, log, url, c.Fetch_timeout,
 		)
 
 		// if there was an error, create an entry that we will put in
 		// the resulting rss feed.
 		if err != nil {
 			log.Info("failed to fetch feed", "url", url, "err", err)
-			errors = append(errors, failedToFetch(url))
+			out_items = append(out_items, failedToFetch(url))
 			continue
 		}
 
-		rfeed := feeds.New()
+		// turn the feed into Items and append them to `out_items`
+		out_i := feedToItems(*feed, url)
+		out_items = append(out_items, out_i...)
 	}
 
-	// if there's any errors in the error list, make a feed
-	// of those and append it too.
+	// now we sort `out_items`
+	sort.Sort(ByDate(out_items))
+
+	// now we turn it into a feed.
+	out_feed := itemsToFeed(out_items, c)
+
+	rss, err := out_feed.ToRss()
+	if err != nil {
+		panic(err)
+	}
+
+	send_result_to <- rss
+}
+
+func itemsToFeed(items []feeds.Item, c Config) feeds.Feed {
+	i_items := make([]*feeds.Item, 0, len(items))
+	for _, item := range items {
+		i_items = append(i_items, &item)
+	}
+
+	return feeds.Feed{
+		Title: c.Out_title,
+		Link: &feeds.Link{
+			Href: c.Out_link,
+		},
+		Description: c.Out_description,
+		Author: &feeds.Author{
+			Name:  c.Out_author_name,
+			Email: c.Out_author_email,
+		},
+		Created: time.Now(),
+		Items:   i_items,
+	}
+}
+
+// ByDate implements sort.Interface for []feeds.Item based on how long ago an
+// item was published.
+type ByDate []feeds.Item
+
+var _ sort.Interface = (*ByDate)(nil)
+
+func (a ByDate) Len() int {
+	return len(a)
+}
+
+func (a ByDate) Swap(i int, j int) {
+	a[i], a[j] = a[j], a[i]
+}
+
+func (a ByDate) Less(i int, j int) bool {
+	return a[i].Created.After(a[i].Created)
 }
 
 func fetchFeed(
@@ -156,57 +317,59 @@ func failedToFetch(url string) feeds.Item {
 }
 
 func entryTitle(feed_title string, entry_title string) string {
-	if feed_title == nil && entry_title == nil {
-		return nil
+	if feed_title == "" && entry_title == "" {
+		return ""
 	}
-	if feed_title == nil {
+	if feed_title == "" {
 		return entry_title
 	}
-	if entry_title == nil {
+	if entry_title == "" {
 		return feed_title
 	}
 	return fmt.Sprintf("%s | %s", feed_title, entry_title)
 }
 
-func feedsToItems(in_feeds []gofeed.Feed) []feeds.Item {
+func feedToItems(in_feed gofeed.Feed, url string) []feeds.Item {
 	var items []feeds.Item
 
-	for _, f := range in_feeds {
-
+	for _, fi := range in_feed.Items {
+		new_item := inItemToOutItem(*fi, in_feed.Title, url)
+		items = append(items, new_item)
 	}
 
 	return items
 }
 
-func feedToItems(in_feed gofeed.Feed) feeds.Item {
-	var items []feeds.Item
-
-	for _, fi := in_feed.Items {
-		new_item := inItemToOutItem(fi)
-		items = append(items, new_item)
-	}
-}
-
 func inItemToOutItem(in gofeed.Item, feed_title string, feed_url string) feeds.Item {
 	item := feeds.Item{
-		Title: entryTitle(feed_title, in.Title),
-		Link: &feeds.Link{Href: in.Link},
-		Source: &feeds.Link{Href: feed_url},
-		Author: &feeds.Author{Name: in.Author.Name, Email: in.Author.Email},
+		Title:       entryTitle(feed_title, in.Title),
+		Link:        &feeds.Link{Href: in.Link},
+		Source:      &feeds.Link{Href: feed_url},
 		Description: in.Description,
-		Id: bundledGuid(feed_url, in.GUID),
-		// we made our own guid, so the guid will never be a permalink.
-		IsPermaLink: false,
-		Updated: *in.UpdatedParsed,
-		Created: *in.PublishedParsed,
-		Content: in.Content,
+		Id:          bundledGuid(feed_url, in.GUID),
+		Content:     in.Content,
 	}
+
+	if in.UpdatedParsed != nil {
+		item.Updated = *in.UpdatedParsed
+	}
+	if in.PublishedParsed != nil {
+		item.Created = *in.PublishedParsed
+	} else {
+		// TODO: we should probably handle this better.
+		item.Created = time.Now()
+	}
+
+	if in.Author != nil {
+		item.Author = &feeds.Author{Name: in.Author.Name, Email: in.Author.Email}
+	}
+
 	if len(in.Enclosures) > 0 {
 		e := in.Enclosures[0]
 		item.Enclosure = &feeds.Enclosure{
-			Url: e.URL,
+			Url:    e.URL,
 			Length: e.Length,
-			Type: e.Type,
+			Type:   e.Type,
 		}
 	}
 
@@ -218,7 +381,7 @@ func inItemToOutItem(in gofeed.Item, feed_title string, feed_url string) feeds.I
 // concatting the hashes.
 func bundledGuid(feed_url string, in_guid string) string {
 	in := in_guid
-	if in == nil {
+	if in == "" {
 		in = "nil"
 	}
 	md5.New()
@@ -226,32 +389,31 @@ func bundledGuid(feed_url string, in_guid string) string {
 }
 
 func shortHash(in string) string {
-	in := in
-	if in == nil {
+	if in == "" {
 		// so we can at least have some hash, even if all the nil
 		// ones are the same.
 		in = "nil"
 	}
-	in := strings.TrimSpace(in)
+	in = strings.TrimSpace(in)
 	if len(in) == 0 {
 		in = "nil"
 	}
 
 	in_b := []byte(in)
 	hash := md5.Sum(in_b)
-	hash_str := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(hash)
-	
+	hash_str := base32.StdEncoding.WithPadding(base32.NoPadding).EncodeToString(hash[:])
+
 	return firstNOfString(hash_str, 7)
 }
 
 // return the first n runes of s
 func firstNOfString(s string, n int) string {
-    i := 0
-    for j := range s {
-        if i == n {
-            return s[:j]
-        }
-        i++
-    }
-    return s
+	i := 0
+	for j := range s {
+		if i == n {
+			return s[:j]
+		}
+		i++
+	}
+	return s
 }

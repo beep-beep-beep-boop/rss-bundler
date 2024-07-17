@@ -5,6 +5,7 @@ go 1.22.5
 require (
 	github.com/gorilla/feeds v1.2.0
 	github.com/mmcdole/gofeed v1.3.0
+	github.com/sethvargo/go-envconfig v1.1.0
 	github.com/thejerf/suture/v4 v4.0.5
 	github.com/thejerf/sutureslog v1.0.1
 )
