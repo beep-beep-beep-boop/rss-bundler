@@ -1,7 +1,7 @@
 all: build
 
 build:
-	go build -o rssbundler .
+	GOFLAGS=-mod=vendor go build -o rssbundler .
 
 run: build
 	./rssbundler

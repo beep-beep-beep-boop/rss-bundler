@@ -6,8 +6,6 @@ COPY . .
 
 RUN apk add --no-cache make
 
-RUN go mod download
-
 RUN make
 
 # --- make final container ---
