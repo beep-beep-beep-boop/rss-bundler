@@ -1,4 +1,4 @@
-module github.com/beep-beep-beep-boop/rss-bundler
+module git.sr.ht/~bbbb/rss-bundler
 
 go 1.22.5
 

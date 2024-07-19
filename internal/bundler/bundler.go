@@ -10,8 +10,8 @@ import (
 	"strings"
 	"time"
 
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/common"
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/entry_timeout"
+	"git.sr.ht/~bbbb/rss-bundler/internal/common"
+	"git.sr.ht/~bbbb/rss-bundler/internal/entry_timeout"
 	"github.com/gorilla/feeds"
 	"github.com/mmcdole/gofeed"
 )

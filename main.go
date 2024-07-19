@@ -11,10 +11,10 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/bundler"
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/cache"
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/common"
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/entry_timeout"
+	"git.sr.ht/~bbbb/rss-bundler/internal/bundler"
+	"git.sr.ht/~bbbb/rss-bundler/internal/cache"
+	"git.sr.ht/~bbbb/rss-bundler/internal/common"
+	"git.sr.ht/~bbbb/rss-bundler/internal/entry_timeout"
 	"github.com/thejerf/suture/v4"
 	"github.com/thejerf/sutureslog"
 )

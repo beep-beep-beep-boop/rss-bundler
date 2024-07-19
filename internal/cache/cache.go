@@ -5,8 +5,8 @@ import (
 	"log/slog"
 	"time"
 
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/bundler"
-	"github.com/beep-beep-beep-boop/rss-bundler/internal/common"
+	"git.sr.ht/~bbbb/rss-bundler/internal/bundler"
+	"git.sr.ht/~bbbb/rss-bundler/internal/common"
 )
 
 type Cache struct {
