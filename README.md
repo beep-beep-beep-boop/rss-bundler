@@ -62,3 +62,7 @@ OUTFEED_ERROR_COOLDOWN=24h
 # optional.
 DEBUG=false
 ```
+
+## Issue tracker & Contributing
+
+The issue tracker for this software is located [here](https://todo.sr.ht/~bbbb/bbbb?search=label%3A%22rss-bundler%22). For sending patches or discussing rss-bundler, you can go [here](https://lists.sr.ht/~bbbb/bbbb) (or email `~bbbb/bbbb@lists.sr.ht`).
